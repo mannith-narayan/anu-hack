@@ -17,13 +17,11 @@ test_dir = 'dataset/test'
 # Image parameters
 IMAGE_SIZE = (224, 224)
 BATCH_SIZE = 16
-NUM_CLASSES = 2
 
 # Check if GPU is available
 print("Num GPUs Available: ", len(tf.config.list_physical_devices('GPU')))
 
 # Data Generators
-# Training data generator with augmentation
 train_datagen = ImageDataGenerator(
     rescale=1./255,
     rotation_range=20,
@@ -33,46 +31,62 @@ train_datagen = ImageDataGenerator(
     shear_range=0.2
 )
 
-# Validation and test data generators without augmentation
 validation_datagen = ImageDataGenerator(rescale=1./255)
 test_datagen = ImageDataGenerator(rescale=1./255)
 
-# Create data generators
-train_generator = train_datagen.flow_from_directory(
-    train_dir,
-    target_size=IMAGE_SIZE,
-    batch_size=BATCH_SIZE,
-    class_mode='binary'
-)
+# Create data generators with error checking
+def create_generator(directory, datagen, subset=None):
+    if not os.path.exists(directory):
+        raise FileNotFoundError(f"Directory not found: {directory}")
+    
+    classes = os.listdir(directory)
+    if len(classes) != 2:
+        raise ValueError(f"Expected 2 class subdirectories (asbestos, non_asbestos), found {len(classes)}")
+    
+    print(f"Classes found in {directory}: {classes}")
+    
+    generator = datagen.flow_from_directory(
+        directory,
+        target_size=IMAGE_SIZE,
+        batch_size=BATCH_SIZE,
+        class_mode='binary',
+        shuffle=True if subset == 'training' else False,
+        subset=subset
+    )
+    
+    print(f"Generator for {directory} created successfully.")
+    print(f"Number of samples: {generator.samples}")
+    print(f"Class indices: {generator.class_indices}")
+    
+    if generator.samples == 0:
+        raise ValueError(f"No images found in {directory}")
+    
+    return generator
 
-validation_generator = validation_datagen.flow_from_directory(
-    validation_dir,
-    target_size=IMAGE_SIZE,
-    batch_size=BATCH_SIZE,
-    class_mode='binary'
-)
+try:
+    train_generator = create_generator(train_dir, train_datagen, subset='training')
+    validation_generator = create_generator(validation_dir, validation_datagen)
+    test_generator = create_generator(test_dir, test_datagen)
+except Exception as e:
+    print(f"Error creating data generators: {str(e)}")
+    raise
 
-test_generator = test_datagen.flow_from_directory(
-    test_dir,
-    target_size=IMAGE_SIZE,
-    batch_size=BATCH_SIZE,
-    class_mode='binary'
-)
+# Check if we have enough data to train
+if train_generator.samples < BATCH_SIZE:
+    raise ValueError(f"Not enough training samples. Found {train_generator.samples}, need at least {BATCH_SIZE}")
+
+if validation_generator.samples == 0:
+    print("Warning: No validation data found. Training will proceed without validation.")
 
 # Build the Model
-# Load the ResNet50 model without the top layers
 base_model = ResNet50(weights='imagenet', include_top=False, input_shape=(IMAGE_SIZE[0], IMAGE_SIZE[1], 3))
-
-# Freeze the base model layers
 base_model.trainable = False
 
-# Add custom layers on top
 x = base_model.output
 x = GlobalAveragePooling2D()(x)
 x = Dense(128, activation='relu')(x)
 output = Dense(1, activation='sigmoid')(x)
 
-# Create the complete model
 model = Model(inputs=base_model.input, outputs=output)
 
 # Compile the Model
@@ -82,49 +96,45 @@ model.compile(
     metrics=['accuracy']
 )
 
+# Print model summary
+model.summary()
+
 # Train the Model
 epochs = 10
-history = model.fit(
-    train_generator,
-    steps_per_epoch=train_generator.samples // BATCH_SIZE,
-    validation_data=validation_generator,
-    validation_steps=validation_generator.samples // BATCH_SIZE,
-    epochs=epochs
-)
-
-# Fine-Tune the Model
-# Unfreeze some layers in the base model
-base_model.trainable = True
-
-# Freeze earlier layers if necessary
-fine_tune_at = 100  # Freeze all layers before this layer
-for layer in base_model.layers[:fine_tune_at]:
-    layer.trainable = False
-
-# Re-compile the model with a lower learning rate
-model.compile(
-    optimizer=Adam(learning_rate=0.0001),
-    loss='binary_crossentropy',
-    metrics=['accuracy']
-)
-
-# Continue training
-fine_tune_epochs = 5
-total_epochs = epochs + fine_tune_epochs
-
-fine_tune_history = model.fit(
-    train_generator,
-    steps_per_epoch=train_generator.samples // BATCH_SIZE,
-    validation_data=validation_generator,
-    validation_steps=validation_generator.samples // BATCH_SIZE,
-    epochs=total_epochs,
-    initial_epoch=history.epoch[-1]
-)
+try:
+    history = model.fit(
+        train_generator,
+        steps_per_epoch=train_generator.samples // BATCH_SIZE,
+        epochs=epochs,
+        validation_data=validation_generator if validation_generator.samples > 0 else None,
+        validation_steps=validation_generator.samples // BATCH_SIZE if validation_generator.samples > 0 else None,
+        verbose=1
+    )
+except Exception as e:
+    print(f"Error during model training: {str(e)}")
+    raise
 
 # Evaluate the Model
-test_loss, test_accuracy = model.evaluate(test_generator, steps=test_generator.samples // BATCH_SIZE)
-print(f'Test Accuracy: {test_accuracy * 100:.2f}%')
+if test_generator.samples > 0:
+    test_loss, test_accuracy = model.evaluate(test_generator, steps=test_generator.samples // BATCH_SIZE)
+    print(f'Test Accuracy: {test_accuracy * 100:.2f}%')
+else:
+    print("Warning: No test data found. Skipping evaluation.")
 
 # Save the Model
 model.save('models/asbestos_detector.h5')
 print("Model saved to 'models/asbestos_detector.h5'")
+
+# Function to make predictions
+def predict_image(img_path):
+    img = tf.keras.preprocessing.image.load_img(img_path, target_size=IMAGE_SIZE)
+    img_array = tf.keras.preprocessing.image.img_to_array(img)
+    img_array = tf.expand_dims(img_array, 0)  # Create batch axis
+    img_array /= 255.  # Rescale the image
+
+    prediction = model.predict(img_array)[0][0]
+    print(f"Probability of asbestos: {prediction*100:.2f}%")
+    print(f"Classification: {'Asbestos' if prediction > 0.5 else 'Non-Asbestos'}")
+
+# Example usage:
+# predict_image('path/to/your/image.jpg')
